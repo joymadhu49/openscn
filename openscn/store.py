@@ -60,8 +60,187 @@ class Store:
                 CREATE TABLE IF NOT EXISTS refs (
                     name TEXT PRIMARY KEY, target TEXT NOT NULL REFERENCES changesets(id)
                 );
+                CREATE TABLE IF NOT EXISTS derived_values (
+                    name TEXT NOT NULL, version TEXT NOT NULL,
+                    changeset TEXT NOT NULL REFERENCES changesets(id),
+                    cache_key TEXT NOT NULL, value TEXT NOT NULL,
+                    PRIMARY KEY(name, version, changeset, cache_key)
+                );
+                CREATE TABLE IF NOT EXISTS graph_nodes (
+                    id TEXT PRIMARY KEY REFERENCES changesets(id),
+                    generation INTEGER NOT NULL, first_depth INTEGER NOT NULL,
+                    jumps TEXT NOT NULL, parents TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS path_changes (
+                    path TEXT NOT NULL, changeset TEXT NOT NULL REFERENCES changesets(id),
+                    PRIMARY KEY(path, changeset)
+                );
+                CREATE INDEX IF NOT EXISTS path_changes_changeset ON path_changes(changeset);
             """)
         self.empty_tree = self._put_object("tree", canonical({}))
+        self._derivations = {}
+        self.register_derivation("graph", "1", self._compute_graph, eager=True)
+        self.register_derivation("blame", "1", self._compute_blame, parents=self._blame_parents)
+
+    def register_derivation(self, name, version, compute, *, parents="all", eager=False):
+        """Register a deterministic recipe; bump version when its meaning changes.
+
+        compute(changeset, parent_values, key) must return JSON data. ``parents``
+        is 'all', 'first', or a deterministic callable(changeset, key) returning
+        prerequisite changeset IDs. Recipes execute locally, never from HTTP
+        input. Eager recipes run with key=None after each changeset creation.
+        Existing persisted values survive registration and process restarts.
+        """
+        if not isinstance(name, str) or not re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", name):
+            raise SCNError("Invalid derivation name")
+        if not isinstance(version, (str, int)) or isinstance(version, bool) or not str(version):
+            raise SCNError("Derivation version must be a nonempty string or integer")
+        if not callable(compute) or not (parents in ("all", "first") or callable(parents)):
+            raise SCNError("Invalid derivation recipe")
+        if name in ("graph", "blame") and name in self._derivations:
+            raise SCNError("Built-in derivations cannot be replaced")
+        self._derivations[name] = {"version": str(version), "compute": compute,
+                                   "parents": parents, "eager": bool(eager)}
+
+    @staticmethod
+    def _derived_json(value):
+        try:
+            return json.dumps(value, sort_keys=True, separators=(",", ":"),
+                              ensure_ascii=False, allow_nan=False)
+        except (TypeError, ValueError, UnicodeError):
+            raise SCNError("Derived values and keys must be JSON serializable") from None
+
+    def _read_derived(self, name, version, oid, key):
+        with self._connect() as db:
+            row = db.execute("SELECT value FROM derived_values WHERE name=? AND version=? AND changeset=? AND cache_key=?",
+                             (name, version, oid, key)).fetchone()
+        return (True, json.loads(row[0])) if row else (False, None)
+
+    def _write_derived(self, name, version, change, key, value):
+        encoded = self._derived_json(value)
+        with self._connect() as db:
+            db.execute("INSERT OR IGNORE INTO derived_values VALUES (?,?,?,?,?)",
+                       (name, version, change["id"], key, encoded))
+            stored = db.execute("SELECT value FROM derived_values WHERE name=? AND version=? AND changeset=? AND cache_key=?",
+                                (name, version, change["id"], key)).fetchone()[0]
+            if stored != encoded:
+                raise SCNError("Derivation is not deterministic; use a new recipe version", 500)
+            if name == "graph" and version == "1" and key == "null":
+                db.execute("INSERT OR REPLACE INTO graph_nodes VALUES (?,?,?,?,?)",
+                           (change["id"], value["generation"], value["first_depth"],
+                            self._derived_json(value["jumps"]), self._derived_json(change["parents"])))
+                db.executemany("INSERT OR IGNORE INTO path_changes VALUES (?,?)",
+                               ((path, change["id"]) for path in change["changes"]))
+        return json.loads(encoded)
+
+    def derive(self, name, rev, key=None):
+        """Evaluate a versioned recipe parent-first, using durable cached values.
+
+        An explicit stack handles long histories without Python recursion.
+        A cache hit loads no changeset payload or ancestors. Legacy databases
+        are backfilled lazily from immutable changesets on the first query.
+        """
+        if name not in self._derivations:
+            raise SCNError("Unknown derivation: " + str(name))
+        recipe = self._derivations[name]
+        encoded_key = self._derived_json(key)
+        target = self.resolve(rev)
+        values, active = {}, set()
+        stack = [(target, None, None)]
+        while stack:
+            oid, change, dependencies = stack.pop()
+            if oid in values:
+                continue
+            if change is None:
+                found, value = self._read_derived(name, recipe["version"], oid, encoded_key)
+                if found:
+                    values[oid] = value
+                    continue
+                if oid in active:
+                    raise SCNError("Derivation dependencies contain a cycle")
+                change = self.get_changeset(oid)
+                selector = recipe["parents"]
+                dependencies = (selector(change, key) if callable(selector)
+                                else change["parents"][:1] if selector == "first" else change["parents"])
+                if not isinstance(dependencies, list):
+                    raise SCNError("Derivation dependencies must be a list")
+                for parent in dependencies:
+                    validate_oid(parent)
+                active.add(oid)
+                stack.append((oid, change, dependencies))
+                stack.extend((parent, None, None) for parent in reversed(dependencies) if parent not in values)
+            else:
+                value = recipe["compute"](change, [values[p] for p in dependencies], key)
+                values[oid] = self._write_derived(name, recipe["version"], change, encoded_key, value)
+                active.remove(oid)
+        return values[target]
+
+    def clear_derived(self, name=None):
+        """Discard rebuildable caches only; changesets, objects, and refs survive.
+
+        Run administrative rebuilds while writers are stopped. Registered
+        recipe versions share the same name and are all discarded together.
+        """
+        with self._connect() as db:
+            if name is None:
+                db.execute("DELETE FROM derived_values")
+            else:
+                db.execute("DELETE FROM derived_values WHERE name=?", (name,))
+            if name is None or name == "graph":
+                db.execute("DELETE FROM path_changes")
+                db.execute("DELETE FROM graph_nodes")
+
+    def rebuild_derived(self, name, rev, key=None):
+        """Clear every cached version of one recipe, then rebuild through rev."""
+        if name not in self._derivations:
+            raise SCNError("Unknown derivation: " + str(name))
+        self.clear_derived(name)
+        return self.derive(name, rev, key)
+
+    def _compute_graph(self, change, parents, key):
+        jumps = change["parents"][:1]
+        level = 1
+        while jumps:
+            previous = parents[0] if level == 1 else self._graph(jumps[-1])
+            if len(previous["jumps"]) < level:
+                break
+            jumps.append(previous["jumps"][level - 1])
+            level += 1
+        return {"generation": 1 + max((p["generation"] for p in parents), default=0),
+                "first_depth": 1 + (parents[0]["first_depth"] if parents else 0), "jumps": jumps}
+
+    def _graph(self, oid):
+        with self._connect() as db:
+            row = db.execute("SELECT generation, first_depth, jumps, parents FROM graph_nodes WHERE id=?", (oid,)).fetchone()
+        if not row:
+            self.derive("graph", oid)
+            return self._graph(oid)
+        return {"generation": row[0], "first_depth": row[1], "jumps": json.loads(row[2]), "parents": json.loads(row[3])}
+
+    def first_parent_ancestor(self, rev, distance):
+        """Return the ancestor distance first-parent edges away, or None.
+
+        After graph backfill this takes O(log distance) indexed graph reads.
+        It does not claim logarithmic ancestry queries on an arbitrary DAG.
+        """
+        if not isinstance(distance, int) or isinstance(distance, bool) or distance < 0:
+            raise SCNError("Ancestor distance must be a nonnegative integer")
+        oid = self.resolve(rev)
+        graph = self._graph(oid)
+        if distance >= graph["first_depth"]:
+            return None
+        while distance:
+            level = distance.bit_length() - 1
+            oid = graph["jumps"][level]
+            distance -= 1 << level
+            if distance:
+                graph = self._graph(oid)
+        return oid
+
+    def _on_first_parent_chain(self, candidate, descendant, candidate_depth, descendant_depth):
+        if candidate_depth > descendant_depth:
+            return False
+        return self.first_parent_ancestor(descendant, descendant_depth - candidate_depth) == candidate
 
     @contextmanager
     def _connect(self):
@@ -221,6 +400,9 @@ class Store:
         with self._connect() as db:
             db.execute("INSERT OR IGNORE INTO changesets(id,payload,root) VALUES (?,?,?)",
                        (oid, encoded.decode("utf-8"), root))
+        for name, recipe in list(self._derivations.items()):
+            if recipe["eager"]:
+                self.derive(name, oid)
         return dict(payload, id=oid, root=root)
 
     def manifest(self, rev, prefixes=None):
@@ -268,11 +450,42 @@ class Store:
             validate_path(path)
         result = []
         current = self.resolve(rev)
+        if path is not None:
+            return [self.get_changeset(oid) for oid in self._path_history(current, path, limit)]
         while current and len(result) < limit:
             change = self.get_changeset(current)
             if path is None or any(p == path or p.startswith(path + "/") or path.startswith(p + "/") for p in change["changes"]):
                 result.append(change)
             current = change["parents"][0] if change["parents"] else None
+        return result
+
+    def _path_history(self, rev, path, limit=None):
+        """Index candidate touches, then filter to this first-parent chain.
+
+        The path index finds exact paths, ancestor directory tombstones, and
+        descendant paths for directory queries. Binary lifting excludes touches
+        on unrelated branches without loading their changeset payloads.
+        """
+        graph = self._graph(rev)
+        if limit == 0:
+            return []
+        parts = path.split("/")
+        ancestors = ["/".join(parts[:i]) for i in range(1, len(parts) + 1)]
+        placeholders = ",".join("?" for _ in ancestors)
+        sql = f"""SELECT DISTINCT p.changeset, g.first_depth
+                  FROM path_changes p JOIN graph_nodes g ON g.id=p.changeset
+                  WHERE (p.path IN ({placeholders}) OR (p.path>=? AND p.path<?))
+                    AND g.first_depth<=? AND g.generation<=?
+                  ORDER BY g.first_depth DESC, p.changeset"""
+        result = []
+        with self._connect() as db:
+            candidates = db.execute(sql, [*ancestors, path + "/", path + "0",
+                                          graph["first_depth"], graph["generation"]])
+            for oid, depth in candidates:
+                if self._on_first_parent_chain(oid, rev, depth, graph["first_depth"]):
+                    result.append(oid)
+                    if limit is not None and len(result) == limit:
+                        break
         return result
 
     @staticmethod
@@ -281,7 +494,35 @@ class Store:
                 for p in sorted(before.keys() | after.keys()) if before.get(p) != after.get(p)]
 
     def diff(self, base, target):
-        return self._diff_manifests(self.manifest(base), self.manifest(target))
+        before = self.get_changeset(base)["root"]
+        after = self.get_changeset(target)["root"]
+        changes = []
+
+        def plain(entry):
+            return {"oid": entry["oid"], "executable": entry["executable"]} if entry else None
+
+        def walk(left, right, prefix):
+            if left == right:
+                return
+            a = self.get_tree(left) if left else {}
+            b = self.get_tree(right) if right else {}
+            for name in sorted(a.keys() | b.keys()):
+                old, new = a.get(name), b.get(name)
+                if old == new:
+                    continue
+                path = prefix + name
+                old_tree = old and old["kind"] == "tree"
+                new_tree = new and new["kind"] == "tree"
+                if old_tree or new_tree:
+                    walk(old["oid"] if old_tree else None, new["oid"] if new_tree else None, path + "/")
+                    if old and not old_tree:
+                        changes.append({"path": path, "before": plain(old), "after": None})
+                    if new and not new_tree:
+                        changes.append({"path": path, "before": None, "after": plain(new)})
+                else:
+                    changes.append({"path": path, "before": plain(old), "after": plain(new)})
+        walk(before, after, "")
+        return sorted(changes, key=lambda change: change["path"])
 
     def _ancestors(self, rev):
         distances = {}
@@ -291,11 +532,26 @@ class Store:
             if current in distances:
                 continue
             distances[current] = distance
-            queue.extend((p, distance + 1) for p in self.get_changeset(current)["parents"])
+            queue.extend((p, distance + 1) for p in self._graph(current)["parents"])
         return distances
 
     def is_ancestor(self, ancestor, descendant):
-        return self.resolve(ancestor) in self._ancestors(descendant)
+        ancestor, descendant = self.resolve(ancestor), self.resolve(descendant)
+        wanted, start = self._graph(ancestor), self._graph(descendant)
+        if self._on_first_parent_chain(ancestor, descendant, wanted["first_depth"], start["first_depth"]):
+            return True
+        visited, pending = set(), [descendant]
+        while pending:
+            oid = pending.pop()
+            if oid == ancestor:
+                return True
+            if oid in visited:
+                continue
+            visited.add(oid)
+            graph = self._graph(oid)
+            if graph["generation"] > wanted["generation"]:
+                pending.extend(graph["parents"])
+        return False
 
     def merge_base(self, left, right):
         a, b = self._ancestors(left), self._ancestors(right)
@@ -352,30 +608,45 @@ class Store:
         delta = {d["path"]: d["after"] for d in self._diff_manifests(ours, merged)}
         return self.create_changeset([onto], delta, message, author)
 
+    def _file_entry(self, root, path):
+        parts = path.split("/")
+        for i, part in enumerate(parts):
+            entry = self.get_tree(root).get(part)
+            if entry is None:
+                return None
+            if i == len(parts) - 1:
+                return entry if entry["kind"] == "blob" else None
+            if entry["kind"] != "tree":
+                return None
+            root = entry["oid"]
+        return None
+
+    def _blame_parents(self, change, path):
+        validate_path(path)
+        if not change["parents"]:
+            return []
+        return self._path_history(change["parents"][0], path, 1)
+
+    def _compute_blame(self, change, parents, path):
+        entry = self._file_entry(change["root"], path)
+        if entry is None:
+            return {"exists": False, "text": True, "lines": []}
+        try:
+            lines = self.get_blob(entry["oid"]).decode("utf-8").splitlines(keepends=True)
+        except UnicodeDecodeError:
+            return {"exists": True, "text": False, "lines": []}
+        previous = parents[0]["lines"] if parents else []
+        old_lines = [line["text"] for line in previous]
+        updated = [{"text": text, "changeset": change["id"], "author": change["author"]} for text in lines]
+        for block in SequenceMatcher(None, old_lines, lines, autojunk=False).get_matching_blocks():
+            updated[block.b:block.b + block.size] = previous[block.a:block.a + block.size]
+        return {"exists": True, "text": True, "lines": updated}
+
     def blame(self, rev, path):
         validate_path(path)
-        current = self.get_changeset(rev)
-        if path not in self.manifest(current["id"], [path]):
+        result = self.derive("blame", rev, path)
+        if not result["exists"]:
             raise SCNError("File not found", 404)
-        history = []
-        while current:
-            history.append(current)
-            current = self.get_changeset(current["parents"][0]) if current["parents"] else None
-        old_lines, attribution = [], []
-        for change in reversed(history):
-            entry = self.manifest(change["id"], [path]).get(path)
-            try:
-                lines = self.get_blob(entry["oid"]).decode("utf-8").splitlines(keepends=True) if entry else []
-            except UnicodeDecodeError:
-                # A binary historical version breaks line continuity, but does
-                # not stop blame when the requested version is UTF-8 text.
-                if change["id"] == history[0]["id"]:
-                    raise SCNError("Blame requires a UTF-8 text file") from None
-                old_lines, attribution = [], []
-                continue
-            updated = [(change["id"], change["author"])] * len(lines)
-            for block in SequenceMatcher(None, old_lines, lines, autojunk=False).get_matching_blocks():
-                updated[block.b:block.b + block.size] = attribution[block.a:block.a + block.size]
-            old_lines, attribution = lines, updated
-        return [{"line": i + 1, "text": line, "changeset": attribution[i][0], "author": attribution[i][1]}
-                for i, line in enumerate(old_lines)]
+        if not result["text"]:
+            raise SCNError("Blame requires a UTF-8 text file")
+        return [dict(line, line=i + 1) for i, line in enumerate(result["lines"])]

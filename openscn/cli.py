@@ -25,12 +25,17 @@ def parser():
     serve.add_argument("--data", required=True)
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=7777)
+    serve.add_argument("--max-workers", type=int, default=64)
     cache = commands.add_parser("cache", help="Run a bounded HTTP read-through cache")
     cache.add_argument("--upstream", required=True)
     cache.add_argument("--data", required=True)
     cache.add_argument("--host", default="127.0.0.1")
     cache.add_argument("--port", type=int, default=7778)
     cache.add_argument("--max-bytes", type=int, default=DEFAULT_CACHE_BYTES)
+    cache.add_argument("--max-upstream", type=int, default=16)
+    cache.add_argument("--failure-threshold", type=int, default=3)
+    cache.add_argument("--cooldown", type=float, default=5.0)
+    cache.add_argument("--max-workers", type=int, default=64)
     clone = commands.add_parser("clone", help="Create a working copy, optionally restricted to path prefixes")
     clone.add_argument("url")
     clone.add_argument("directory")
@@ -38,6 +43,7 @@ def parser():
     clone.add_argument("--sparse", nargs="+", metavar="PATH")
     clone.add_argument("--cache-bytes", type=int, default=DEFAULT_CACHE_BYTES)
     commands.add_parser("status", help="Show local additions, modifications, and deletions")
+    commands.add_parser("recover", help="Safely continue an interrupted checkout from local staging")
     commit = commands.add_parser("commit", help="Upload local changes as a changeset; does not advance a ref")
     commit.add_argument("-m", "--message", required=True)
     commit.add_argument("--author", default=_author())
@@ -92,11 +98,11 @@ def _print_diff(workspace, changes, local=False):
 def run(args):
     if args.command == "serve":
         from .server import serve
-        serve(args.data, args.host, args.port)
+        serve(args.data, args.host, args.port, args.max_workers)
         return
     if args.command == "cache":
         from .cache import serve
-        serve(args.upstream, args.data, args.host, args.port, args.max_bytes)
+        serve(args.upstream, args.data, args.host, args.port, args.max_bytes, args.max_upstream, args.failure_threshold, args.cooldown, args.max_workers)
         return
     if args.command == "clone":
         workspace = Workspace.clone(args.url, args.directory, args.rev, args.sparse, args.cache_bytes)
@@ -117,6 +123,8 @@ def run(args):
     elif args.command == "commit":
         result = workspace.commit(args.message, args.author)
         print(f"Created {result['id']}\nRun openscn land to advance {workspace.metadata['ref']}.")
+    elif args.command == "recover":
+        print("Recovered checkout to " + workspace.recover())
     elif args.command == "update":
         print("Updated to " + workspace.update(args.rev)["id"])
     elif args.command == "land":

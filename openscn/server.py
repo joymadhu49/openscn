@@ -6,6 +6,7 @@ import hmac
 import json
 import logging
 import os
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlsplit
 
@@ -20,11 +21,40 @@ MAX_BODY = 32 * 1024 * 1024
 class Server(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+    request_queue_size = 128
 
-    def __init__(self, address, store, token=None):
+    def __init__(self, address, store, token=None, max_workers=64):
+        if max_workers < 1:
+            raise SCNError("max_workers must be positive")
         self.store = store
         self.token = token
+        self.workers = threading.BoundedSemaphore(max_workers)
         super().__init__(address, Handler)
+
+    def process_request(self, request, client_address):
+        if not self.workers.acquire(blocking=False):
+            try:
+                request.settimeout(1)
+                body = b'{"error":"Server at capacity; retry later"}'
+                request.sendall(b"HTTP/1.0 503 Service Unavailable\r\nContent-Type: application/json\r\n"
+                                b"Retry-After: 1\r\nConnection: close\r\nContent-Length: "
+                                + str(len(body)).encode() + b"\r\n\r\n" + body)
+            except OSError:
+                pass
+            finally:
+                self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self.workers.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.workers.release()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -45,6 +75,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Cache-Control", "private, max-age=31536000, immutable" if immutable else "no-store")
+        if status == 503:
+            self.send_header("Retry-After", "5")
         self.end_headers()
         self.wfile.write(data)
 
@@ -179,11 +211,11 @@ class Handler(BaseHTTPRequestHandler):
     do_PUT = handle_request
 
 
-def serve(data, host="127.0.0.1", port=7777):
+def serve(data, host="127.0.0.1", port=7777, max_workers=64):
     token = os.environ.get("OPENSCN_TOKEN") or None
     if host not in ("127.0.0.1", "localhost", "::1") and not token:
         raise SCNError("Set OPENSCN_TOKEN before binding a non-loopback address")
-    server = Server((host, port), Store(data), token)
+    server = Server((host, port), Store(data), token, max_workers)
     print(f"OpenSCN {__version__} listening on http://{host}:{server.server_port}", flush=True)
     try:
         server.serve_forever()

@@ -1,6 +1,6 @@
 # Security
 
-OpenSCN 0.1 is an experimental local-first deployment of a server-first source
+OpenSCN 0.2 is an experimental local-first deployment of a server-first source
 control design. It has not undergone an independent security audit. The
 authoritative server contains all uploaded source content and history.
 

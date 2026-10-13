@@ -7,7 +7,7 @@ import unittest
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
-from openscn.cache import CacheServer, ObjectCache
+from openscn.cache import CacheServer, ObjectCache, UpstreamGuard
 from openscn.errors import SCNError
 from openscn.server import Server
 from openscn.store import Store
@@ -115,8 +115,76 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual(self.request(f"/v1/blobs/{oid}", url=cache_url), b"cached contents")
         self.assert_http_error(502, "/v1/refs", url=cache_url)
 
+    def test_cache_outage_circuit_preserves_cached_objects(self):
+        oid = self.store.put_blob(b"available during outage")
+        cache = CacheServer(("127.0.0.1", 0), self.url, Path(self.temp.name) / "guarded-cache", token="test-token")
+        url = self.start(cache)
+        self.request(f"/v1/blobs/{oid}", url=url)
+        self.server.shutdown()
+        self.server.server_close()
+        for _ in range(3):
+            self.assert_http_error(502, "/v1/refs", url=url)
+        self.assert_http_error(503, "/v1/refs", url=url)
+        self.assertEqual(self.request(f"/v1/blobs/{oid}", url=url), b"available during outage")
+        stats = self.request("/v1/cache/stats", url=url)
+        self.assertTrue(stats["circuit_open"])
+        self.assertEqual(stats["upstream_requests"], 4)
+        self.assertEqual(stats["upstream_rejections"], 1)
+        self.assert_http_error(401, "/v1/cache/stats", url=url, token=None)
+
+    def test_identical_protocol_across_two_cache_tiers(self):
+        first = self.commit([], {"src/x": b"through both tiers"})
+        oid = first["changes"]["src/x"]["oid"]
+        regional = CacheServer(("127.0.0.1", 0), self.url, Path(self.temp.name) / "regional", token="test-token")
+        regional_url = self.start(regional)
+        node = CacheServer(("127.0.0.1", 0), regional_url, Path(self.temp.name) / "node", token="test-token")
+        node_url = self.start(node)
+        self.assertEqual(self.request(f"/v1/blobs/{oid}", url=node_url), b"through both tiers")
+        self.assertEqual(node.guard.requests, 1)
+        self.assertEqual(regional.guard.requests, 1)
+        self.assertEqual(self.request(f'/v1/trees/{first["root"]}', url=node_url)["entries"], self.store.get_tree(first["root"]))
+        self.request("/v1/refs/main", {"target": first["id"], "expected": None}, "POST", url=node_url)
+        self.assertEqual(self.store.resolve("main"), first["id"])
+
+    def test_server_concurrency_limit_rejects_without_spawning(self):
+        server = Server(("127.0.0.1", 0), self.store, "test-token", max_workers=1)
+        url = self.start(server)
+        server.workers.acquire()
+        try:
+            self.assert_http_error(503, "/health", url=url)
+        finally:
+            server.workers.release()
+        self.assertEqual(self.request("/health", url=url)["status"], "ok")
+
 
 class CacheTests(unittest.TestCase):
+    def test_upstream_guard_limits_outage_and_single_recovery_probe(self):
+        now = [100.0]
+        guard = UpstreamGuard(limit=2, failure_threshold=2, cooldown=5, clock=lambda: now[0])
+        first, second = guard.enter(), guard.enter()
+        with self.assertRaises(SCNError) as caught:
+            guard.enter()
+        self.assertEqual(caught.exception.status, 503)
+        guard.finish(first, healthy=False)
+        guard.finish(second, healthy=False)
+        self.assertTrue(guard.stats()["circuit_open"])
+        with self.assertRaises(SCNError):
+            guard.enter()
+        now[0] += 5
+        probe = guard.enter()
+        self.assertTrue(probe)
+        with self.assertRaises(SCNError):
+            guard.enter()
+        guard.finish(probe, healthy=False)
+        now[0] += 5
+        probe = guard.enter()
+        guard.finish(probe, healthy=True)
+        self.assertFalse(guard.stats()["circuit_open"])
+        ordinary = guard.enter()
+        self.assertFalse(ordinary)
+        guard.finish(ordinary, healthy=True)
+        self.assertEqual(guard.stats()["upstream_inflight"], 0)
+
     def test_integrity_corruption_and_bound(self):
         with tempfile.TemporaryDirectory() as temp:
             cache = ObjectCache(temp, 100)

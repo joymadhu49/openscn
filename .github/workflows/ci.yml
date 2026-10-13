@@ -24,6 +24,7 @@ jobs:
       - run: python -m pip install .
       - run: python -m unittest discover -s tests -v
       - run: python examples/demo.py
+      - run: python examples/benchmark.py --files 100 --commits 50
   package:
     runs-on: ubuntu-latest
     steps:

@@ -1,31 +1,33 @@
-# OpenSCN 0.1.0 — experimental first release
+# OpenSCN 0.2.0 — indexed history and recoverable workspaces
 
-OpenSCN is an independent, MIT-licensed exploration of server-first source
-control, inspired by the public Scion article. It is not affiliated with
-Anthropic and is not a production-equivalent implementation of Scion.
+This release brings the implementation closer to the public Scion design with
+persisted derived data, efficient immutable-tree queries, and cache failure
+isolation. OpenSCN remains an independent MIT-licensed alpha, with no Anthropic
+affiliation or production-scale equivalence claim.
 
-This release includes:
+## Changes
 
-- Immutable changesets and recursive trees backed by compressed SHA-256 objects
-  and SQLite metadata.
-- Sparse workspaces with bounded local caches and optional shared HTTP caches.
-- Separate commit and land operations, with compare-and-swap and fast-forward
-  protection for shared references.
-- History, diffs, blame, file-level three-way merge, single-change rebase, and
-  import of reachable history from a local Git repository.
-- An HTTP API, optional bearer token authentication, a Docker recipe, tests,
-  and an executable API demonstration.
+- Persistent versioned derived-data recipes, eager graph indexes and
+  first-parent skip pointers, indexed path history, and lazy cached blame.
+- Merkle-aware diffs that avoid walking unchanged subtrees.
+- Checkout staging with memory bounded by one blob, workspace mutation locks,
+  and offline `openscn recover` for interrupted installation.
+- Fixes for tracked and untracked files changed during checkout fetching.
+- Coalesced cache misses, disposable cache disk failure handling, bounded
+  upstream requests, an outage circuit breaker, and cache statistics.
+- Independent fault review, a reproducible local benchmark, and a detailed
+  [Scion design comparison](https://github.com/joymadhu49/openscn/blob/v0.2.0/docs/scion-comparison.md).
 
-## Install and try
+## Install
 
-Requires Python 3.11 or newer; there are no third-party runtime dependencies.
+Requires Python 3.11+ on macOS or Linux. In an activated virtual environment:
 
 ```sh
-python -m pip install /path/to/openscn-0.1.0-py3-none-any.whl
+python -m pip install /path/to/openscn-0.2.0-py3-none-any.whl
 openscn serve --data .openscn-server
 ```
 
-In another terminal:
+In another terminal using the same environment:
 
 ```sh
 openscn clone http://127.0.0.1:7777 demo
@@ -35,18 +37,20 @@ openscn commit -m 'First change' --author 'Your Name'
 openscn land
 ```
 
-The attached `SHA256SUMS` file records hashes for both distribution files.
-The [README](https://github.com/joymadhu49/openscn#readme) provides the full
-quickstart, cache setup, Docker instructions, and API links.
+The attached `SHA256SUMS` covers both distribution files. The
+[README](https://github.com/joymadhu49/openscn#readme) includes sparse checkout,
+cache setup, Git import, Docker, and API instructions.
 
-## Boundaries
+## Upgrade and boundaries
 
-This is an alpha release for local evaluation and development. It uses one
-authoritative server with SQLite and disk storage. It does not include a
-virtual filesystem, distributed metadata, fine-grained identity and access
-management, or demonstrated enterprise-scale performance. Merge conflicts are
-detected at file granularity. Use a trusted network and TLS proxy for network
-deployments, and back up authoritative metadata and objects together.
+Stop the server and back up its entire data directory before upgrading from
+0.1. New derived tables are created automatically and old graph data backfills
+on demand. Changeset IDs, refs, and HTTP v1 are preserved. See
+[operations and recovery](https://github.com/joymadhu49/openscn/blob/v0.2.0/docs/operations.md).
 
-Releases are distributed through GitHub; this workflow does not publish to
-PyPI or operate a hosted service.
+One authoritative server still uses SQLite and local object storage. There is
+no distributed metadata backend, virtual filesystem, per-user/path IAM, or
+demonstrated production-scale performance. Merges remain file-level. Checkout
+recovery is tested for process interruption, not all power-loss scenarios.
+This release distributes software through GitHub and does not launch a hosted
+source-control service.

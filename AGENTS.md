@@ -24,6 +24,11 @@ SHA-256 objects. Public methods (JSON-serializable outputs):
 - `merge(left, right, message, author) -> dict` creates a two-parent changeset or raises conflict; file-level three-way merge
 - `rebase(rev, onto, message, author) -> dict` replays single changeset or raises conflict
 - `blame(rev, path) -> list[dict]` each `{line: int, text: str, changeset: str, author: str}`
+- `first_parent_ancestor(rev, distance) -> str|None`
+- `register_derivation(name, version, compute, *, parents='all', eager=False)`;
+  `derive(name, rev, key=None)`; `clear_derived(name=None)`;
+  `rebuild_derived(name, rev, key=None)`. See docs/operations.md for callback and
+  administration semantics. Derived metadata is disposable; IDs/refs survive.
 
 `openscn.errors.SCNError(message, status=400, details=None)` exposes those fields.
 
@@ -38,6 +43,7 @@ GET /v1/diff?base=x&target=y -> {changes};
 GET /v1/merge-base?left=x&right=y -> {base};
 GET /v1/blame/{rev}?path=x -> {lines};
 POST /v1/merge -> {left,right,message,author}; POST /v1/rebase -> {rev,onto,message,author}.
+Cache only: authenticated GET /v1/cache/stats -> operational counters.
 Errors: {error: message, details: optional}; HTTP status from SCNError.
 Optional bearer auth via OPENSCN_TOKEN environment variable. Never persist token
 in workspace config. Server listens on loopback by default.
@@ -51,6 +57,10 @@ CLI: `openscn serve --data DIR [--host 127.0.0.1] [--port 7777]`,
 Clone empty server creates an empty workspace; first commit has no parents.
 Commit creates a changeset; land separately advances ref using CAS and ancestry check.
 Workspace metadata lives in .openscn/; refuse symlink traversal and dirty updates.
+Mutations use POSIX flock; interrupted staged checkouts require `openscn recover`.
+Checkout retains one blob at a time; manifests remain in memory. Do not claim
+full streaming or power-loss safety. HTTP handlers and upstream concurrency are
+bounded; cache misses coalesce and fixed upstreams are never bypassed.
 
 Ownership: core agent owns store.py/errors.py and core tests; client agent owns
 client.py/cli.py and client tests; release agent owns docs, packaging, examples,

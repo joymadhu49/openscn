@@ -3,10 +3,14 @@ from __future__ import annotations
 
 import hashlib
 import fnmatch
+import fcntl
+from contextlib import contextmanager
+from functools import wraps
 import json
 import os
 from pathlib import Path
 import stat
+import shutil
 import subprocess
 import tempfile
 import unicodedata
@@ -48,6 +52,36 @@ def _selected(path, prefixes):
 
 def _relevant(path, prefixes):
     return _selected(path, prefixes) or any(p.startswith(path + "/") for p in prefixes)
+
+
+def _sync_directory(path):
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _atomic_json(path, value):
+    fd, temporary = tempfile.mkstemp(dir=path.parent, prefix=path.name + "-")
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(_json(value) + b"\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        _sync_directory(path.parent)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def _mutating(function):
+    @wraps(function)
+    def locked(self, *args, **kwargs):
+        with self._lock():
+            return function(self, *args, **kwargs)
+    return locked
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -216,16 +250,63 @@ class Workspace:
             workspace.update(rev)
         return workspace
 
-    def _save(self):
+    @property
+    def _journal_path(self):
+        return self.root / ".openscn" / "checkout.json"
+
+    def _pending_checkout(self):
+        if self._journal_path.is_symlink():
+            raise SCNError("Checkout journal must not be a symlink")
+        return self._journal_path.exists()
+
+    @contextmanager
+    def _lock(self, recovery=False):
         folder = self.root / ".openscn"
-        fd, temporary = tempfile.mkstemp(dir=folder, prefix="workspace-")
+        if folder.is_symlink():
+            raise SCNError("Workspace metadata must not be a symlink")
+        fd = os.open(folder / "workspace.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
         try:
-            with os.fdopen(fd, "wb") as stream:
-                stream.write(_json(self.metadata) + b"\n")
-            os.replace(temporary, folder / "workspace.json")
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise SCNError("Workspace lock must be a regular file")
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise SCNError("Another OpenSCN command is modifying this workspace; retry when it finishes", 409) from None
+            metadata_path = folder / "workspace.json"
+            if metadata_path.is_symlink():
+                raise SCNError("Workspace metadata must not be a symlink")
+            try:
+                metadata = json.loads(metadata_path.read_text())
+                changed_client = metadata["server"] != self.client.url or metadata.get("cache_bytes", DEFAULT_CACHE_BYTES) != self.client.max_cache_bytes
+                self.metadata = metadata
+                if changed_client:
+                    self.client = HTTPClient(metadata["server"], folder / "cache", metadata.get("cache_bytes", DEFAULT_CACHE_BYTES))
+            except (ValueError, KeyError) as exc:
+                raise SCNError("Invalid workspace metadata") from exc
+            if self._pending_checkout() and not recovery:
+                raise SCNError("An interrupted checkout needs recovery; run openscn recover. Local edits will be checked before any file is replaced", 409)
+            yield
         finally:
-            if os.path.exists(temporary):
-                os.unlink(temporary)
+            os.close(fd)  # Closing also releases flock, including on exceptions.
+
+    def _save(self):
+        _atomic_json(self.root / ".openscn" / "workspace.json", self.metadata)
+
+    def _file_entry(self, path):
+        target = self._safe(path)
+        try:
+            info = target.stat()
+        except (FileNotFoundError, NotADirectoryError):
+            return None
+        if stat.S_ISDIR(info.st_mode):
+            return "directory"
+        if not stat.S_ISREG(info.st_mode):
+            raise SCNError(f"Unsupported special file: {path}")
+        digest = hashlib.sha256(b"blob\0")
+        with target.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return {"oid": digest.hexdigest(), "executable": bool(info.st_mode & 0o111)}
 
     def _safe(self, path):
         _path(path)
@@ -287,17 +368,20 @@ class Workspace:
                 if stat.S_ISDIR(info.st_mode):
                     walk(child, path + "/")
                 elif stat.S_ISREG(info.st_mode) and _selected(path, prefixes):
-                    files[path] = {"oid": _oid("blob", child.read_bytes()), "executable": bool(info.st_mode & 0o111)}
+                    files[path] = self._file_entry(path)
                 elif not stat.S_ISREG(info.st_mode):
                     raise SCNError(f"Unsupported special file: {path}")
         walk(self.root)
         return files
 
     def status(self):
+        if self._pending_checkout():
+            raise SCNError("An interrupted checkout needs recovery; run openscn recover", 409)
         working = self._working()
         baseline = self.metadata["files"]
         return [{"path": path, "status": "added" if path not in baseline else "deleted" if path not in working else "modified", "before": baseline.get(path), "after": working.get(path)} for path in sorted(baseline.keys() | working.keys()) if baseline.get(path) != working.get(path)]
 
+    @_mutating
     def commit(self, message, author):
         if not message.strip():
             raise SCNError("Commit message must not be empty")
@@ -324,7 +408,7 @@ class Workspace:
         self._save()
         return changeset
 
-    def _checkout(self, changeset, files):
+    def _validate_checkout(self, files):
         # Refuse aliases even on a case-sensitive filesystem, so this working
         # copy cannot silently lose files when used on macOS's default volume.
         aliases = {}
@@ -356,54 +440,142 @@ class Workspace:
                     break
                 if parent.exists() and not parent.is_dir() and parent.relative_to(self.root).as_posix() not in old:
                     raise SCNError(f"Untracked file blocks directory: {parent.relative_to(self.root)}", 409)
-        # Complete all network reads before touching the working tree.
-        blobs = {entry["oid"]: self.client.get_blob(entry["oid"]) for path, entry in files.items() if old.get(path) != entry}
-        for path in sorted(old.keys() - files.keys(), key=lambda p: (-p.count("/"), p)):
-            target = self._safe(path)
+
+    def _checkout(self, changeset, files, metadata_changes=None):
+        self._validate_checkout(files)
+        old = self.metadata["files"]
+        staging = Path(tempfile.mkdtemp(dir=self.root / ".openscn", prefix="checkout-stage-"))
+        journal_created = False
+        try:
+            operations = [{"path": path, "before": old[path], "after": None} for path in sorted(old.keys() - files.keys(), key=lambda p: (-p.count("/"), p))]
+            for path, entry in sorted(files.items()):
+                if old.get(path) == entry:
+                    continue
+                name = str(len(operations)) + ".blob"
+                # One verified blob is held at a time, independent of checkout size.
+                with (staging / name).open("xb") as stream:
+                    stream.write(self.client.get_blob(entry["oid"]))
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.chmod(staging / name, 0o755 if entry["executable"] else 0o644)
+                operations.append({"path": path, "before": old.get(path), "after": entry, "staged": name})
+            _sync_directory(staging)
+            # Editors do not participate in our lock. Check again after fetching.
+            self._validate_checkout(files)
+            after = {**self.metadata, **(metadata_changes or {}), "head": changeset["id"], "files": files}
+            journal = {"version": 1, "before": self.metadata, "after": after, "staging": staging.name, "operations": operations, "next": 0}
+            _atomic_json(self._journal_path, journal)
+            journal_created = True
+            self._resume_checkout(journal)
+        finally:
+            if not journal_created and not self._journal_path.exists():
+                shutil.rmtree(staging)
+
+    def _apply_checkout_operation(self, operation, staging):
+        path = operation["path"]
+        target = self._safe(path)
+        current = self._file_entry(path)
+        before, after = operation["before"], operation["after"]
+        if current == after:
+            return  # A crash may happen after rename/unlink but before journal progress.
+        if current != before and not (current == "directory" and before is None and after is not None):
+            raise SCNError(f"Checkout stopped to preserve local edits at {path}. Save or move those edits outside the workspace, restore the original file if needed, then run openscn recover", 409)
+        if after is None:
             target.unlink()
+            _sync_directory(target.parent)
             parent = target.parent
             while parent != self.root:
                 try:
                     parent.rmdir()
                 except OSError:
                     break
+                _sync_directory(parent.parent)
                 parent = parent.parent
-        for path, entry in sorted(files.items()):
-            target = self._safe(path)
-            if old.get(path) == entry:
-                continue
-            if target.is_dir():
-                # Preflight established that only tracked files occupied this path.
-                def remove_empty(directory):
-                    for child in directory.iterdir():
-                        if child.is_dir():
-                            remove_empty(child)
-                    directory.rmdir()
-                remove_empty(target)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            fd, temporary = tempfile.mkstemp(dir=target.parent, prefix=".openscn-write-")
-            try:
-                with os.fdopen(fd, "wb") as stream:
-                    stream.write(blobs[entry["oid"]])
-                os.chmod(temporary, 0o755 if entry["executable"] else 0o644)
-                os.replace(temporary, target)
-            finally:
-                if os.path.exists(temporary):
-                    os.unlink(temporary)
-        self.metadata.update(head=changeset["id"], files=files)
-        self._save()
+            return
+        source = staging / operation["staged"]
+        if source.is_symlink() or not source.is_file():
+            raise SCNError("Checkout staging is missing or unsafe; preserve the workspace and clone the target revision into a new directory", 409)
+        digest = hashlib.sha256(b"blob\0")
+        with source.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        if digest.hexdigest() != after["oid"]:
+            raise SCNError("Checkout staging failed integrity verification; preserve the workspace and clone the target revision into a new directory", 409)
+        # Integrity checking can take time for a large blob; recheck edits made
+        # during that read before replacing anything in the working copy.
+        latest = self._file_entry(path)
+        if latest == after:
+            return
+        if latest != current:
+            raise SCNError(f"Checkout stopped to preserve local edits at {path}; save those edits outside the workspace and run openscn recover", 409)
+        if target.is_dir():
+            def remove_empty(directory):
+                for child in directory.iterdir():
+                    if child.is_symlink() or not child.is_dir():
+                        raise SCNError(f"Untracked path blocks checkout: {child.relative_to(self.root)}; preserve it elsewhere, then run openscn recover", 409)
+                    remove_empty(child)
+                directory.rmdir()
+            remove_empty(target)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        self._safe(path)
+        os.chmod(source, 0o755 if after["executable"] else 0o644)
+        os.replace(source, target)
+        _sync_directory(target.parent)
+        _sync_directory(staging)
 
+    def _resume_checkout(self, journal):
+        staging_name = journal["staging"]
+        if not isinstance(staging_name, str) or not staging_name.startswith("checkout-stage-") or "/" in staging_name or "\\" in staging_name:
+            raise SCNError("Invalid checkout staging path")
+        staging = self.root / ".openscn" / staging_name
+        if staging.is_symlink():
+            raise SCNError("Checkout staging must not be a symlink")
+        progress = staging / "progress.json"
+        if progress.is_symlink():
+            raise SCNError("Checkout progress must not be a symlink")
+        next_operation = json.loads(progress.read_text())["next"] if progress.exists() else 0
+        if not isinstance(next_operation, int) or not 0 <= next_operation <= len(journal["operations"]):
+            raise SCNError("Invalid checkout progress")
+        for index in range(next_operation, len(journal["operations"])):
+            operation = journal["operations"][index]
+            if operation.get("staged") != str(index) + ".blob" and operation["after"] is not None:
+                raise SCNError("Invalid staged object path")
+            self._apply_checkout_operation(operation, staging)
+            _atomic_json(progress, {"next": index + 1})
+        self.metadata = journal["after"]
+        self._save()
+        self._journal_path.unlink()
+        _sync_directory(self._journal_path.parent)
+        shutil.rmtree(staging, ignore_errors=True)
+        return self.metadata["head"]
+
+    def recover(self):
+        """Continue an interrupted checkout without replacing conflicting edits."""
+        with self._lock(recovery=True):
+            if not self._pending_checkout():
+                raise SCNError("No interrupted checkout to recover")
+            try:
+                journal = json.loads(self._journal_path.read_text())
+                if journal["version"] != 1 or not isinstance(journal["next"], int) or not 0 <= journal["next"] <= len(journal["operations"]):
+                    raise ValueError("invalid journal")
+                if self.metadata != journal["before"] and self.metadata != journal["after"]:
+                    raise SCNError("Workspace metadata changed after checkout was interrupted; preserve it and clone the target revision into a new directory", 409)
+                return self._resume_checkout(journal)
+            except (ValueError, KeyError, TypeError) as exc:
+                raise SCNError("Invalid checkout journal; preserve the workspace and clone the target revision into a new directory") from exc
+
+    @_mutating
     def update(self, rev=None):
         refs = self.client.refs()
         rev = rev or self.metadata["ref"]
         changeset, files = self.client.manifest(refs.get(rev, rev), self.metadata["sparse"])
-        self._checkout(changeset, files)
-        self.metadata["refs"] = refs
+        metadata_changes = {"refs": refs}
         if rev in refs:
-            self.metadata["ref"] = rev
-        self._save()
+            metadata_changes["ref"] = rev
+        self._checkout(changeset, files, metadata_changes)
         return changeset
 
+    @_mutating
     def land(self, ref=None):
         ref = ref or self.metadata["ref"]
         if self.metadata["head"] is None:
@@ -415,6 +587,7 @@ class Workspace:
         self._save()
         return result
 
+    @_mutating
     def integrate(self, operation, rev, message, author):
         if self.metadata["head"] is None:
             raise SCNError("Create or check out a changeset first")
@@ -426,9 +599,7 @@ class Workspace:
         body.update(message=message, author=author)
         result = self.client.request("POST", "/v1/" + operation, body)
         changeset, files = self.client.manifest(result["id"], self.metadata["sparse"])
-        self._checkout(changeset, files)
-        self.metadata["refs"] = refs
-        self._save()
+        self._checkout(changeset, files, {"refs": refs})
         return result
 
 

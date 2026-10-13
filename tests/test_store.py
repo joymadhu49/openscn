@@ -1,6 +1,8 @@
 import concurrent.futures
 import hashlib
 import random
+import json
+import sqlite3
 from pathlib import Path
 import tempfile
 import unittest
@@ -200,6 +202,149 @@ class StoreTests(unittest.TestCase):
                 self.assertEqual(self.store.manifest(merged["id"]), expected)
                 rebased = self.store.rebase(right["id"], left["id"], "r", "M")
                 self.assertEqual(self.store.manifest(rebased["id"]), expected)
+
+    def test_merkle_diff_skips_identical_subtrees(self):
+        base = self.commit(changes={f"d{i}/nested/file": self.entry(str(i)) for i in range(50)})
+        head = self.commit([base["id"]], {"d3/nested/file": self.entry("changed")})
+        original = self.store.get_tree
+        seen = []
+        def tracked(oid):
+            seen.append(oid)
+            return original(oid)
+        with patch.object(self.store, "get_tree", tracked), patch.object(self.store, "manifest", side_effect=AssertionError("diff flattened entire tree")):
+            result = self.store.diff(base["id"], head["id"])
+        self.assertEqual([entry["path"] for entry in result], ["d3/nested/file"])
+        self.assertEqual(len(seen), 6)  # two roots and two directories on each side
+        unchanged = original(base["root"])["d4"]["oid"]
+        self.assertNotIn(unchanged, seen)
+        with patch.object(self.store, "get_tree", side_effect=AssertionError("equal root read")):
+            self.assertEqual(self.store.diff(head["id"], head["id"]), [])
+        # A directory-to-file replacement is an explicit descendant deletion.
+        replaced = self.commit([head["id"]], {"d3/nested/file": None, "d3": self.entry("file")})
+        self.assertEqual(self.store.diff(head["id"], replaced["id"]),
+                         self.store._diff_manifests(self.store.manifest(head["id"]), self.store.manifest(replaced["id"])))
+
+    def test_versioned_derivations_restart_eager_and_rebuild(self):
+        computed = []
+        def recipe(change, parents, key):
+            computed.append(change["id"])
+            return {"count": 1 + max((p["count"] for p in parents), default=0), "key": key}
+        self.store.register_derivation("height", 1, recipe, eager=True)
+        base = self.commit()
+        head = self.commit([base["id"]], {"file": self.entry("text\n")})
+        self.store.update_ref("main", head["id"], None)
+        self.assertEqual(computed, [base["id"], head["id"]])
+        self.assertEqual(self.store.derive("height", "main"), {"count": 2, "key": None})
+        self.assertEqual(self.store.derive("height", "main", {"x": 1}), {"count": 2, "key": {"x": 1}})
+        restored = Store(self.temp.name)
+        def forbidden(*args):
+            self.fail("persisted derivation was recomputed")
+        restored.register_derivation("height", 1, forbidden)
+        with patch.object(restored, "get_changeset", side_effect=AssertionError("cache hit read history")):
+            self.assertEqual(restored.derive("height", "main"), {"count": 2, "key": None})
+        restored.register_derivation("height", 2, lambda change, parents, key: 10 + max(parents, default=0))
+        self.assertEqual(restored.derive("height", "main"), 20)
+        self.assertEqual(restored.rebuild_derived("height", "main"), 20)
+        self.assertEqual(restored.refs(), {"main": head["id"]})
+        self.assertEqual(restored.get_changeset("main"), head)
+        self.assertEqual(restored.get_blob(restored.manifest("main")["file"]["oid"]), b"text\n")
+
+    def test_graph_jumps_and_path_history_skip_unrelated_history(self):
+        first = self.commit(changes={"src/watched": self.entry("one\ntwo\n")})
+        chain = [first]
+        for i in range(130):
+            changes = {"unrelated": self.entry(str(i))}
+            if i == 63:
+                changes["src/watched"] = self.entry("one\nchanged\n")
+            chain.append(self.commit([chain[-1]["id"]], changes))
+        head = chain[-1]
+        graph_reads = []
+        graph = self.store._graph
+        def traced(oid):
+            graph_reads.append(oid)
+            return graph(oid)
+        with patch.object(self.store, "_graph", traced), patch.object(self.store, "get_changeset", side_effect=AssertionError("indexed ancestry read payload")):
+            self.assertEqual(self.store.first_parent_ancestor(head["id"], 127), chain[3]["id"])
+            self.assertLessEqual(len(graph_reads), 8)
+            self.assertTrue(self.store.is_ancestor(first["id"], head["id"]))
+        with patch.object(self.store, "get_changeset", wraps=self.store.get_changeset) as reads:
+            history = self.store.log(head["id"], path="src/watched")
+            self.assertEqual([c["id"] for c in history], [chain[64]["id"], first["id"]])
+            self.assertEqual(reads.call_count, 2)
+        for distance in [0, 1, 2, 3, 64, 128, 130, 131, 1000]:
+            expected = chain[-1 - distance]["id"] if distance < len(chain) else None
+            self.assertEqual(self.store.first_parent_ancestor(head["id"], distance), expected)
+        # The second parent is much deeper than the first-parent chain.
+        merged = self.commit([first["id"], head["id"]])
+        self.assertTrue(self.store.is_ancestor(chain[128]["id"], merged["id"]))
+        self.assertEqual(self.store.derive("graph", merged["id"])["generation"], 132)
+
+    def test_blame_cached_and_skips_unrelated_changes(self):
+        first = self.commit(changes={"src/file": self.entry("one\ntwo\n")})
+        head = first
+        for i in range(30):
+            head = self.commit([head["id"]], {"other": self.entry(str(i))})
+        edited = self.commit([head["id"]], {"src/file": self.entry("one\nnew\n")}, author="Bea")
+        head = self.commit([edited["id"]], {"other": self.entry("last")})
+        with patch.object(self.store, "get_changeset", wraps=self.store.get_changeset) as reads:
+            result = self.store.blame(head["id"], "src/file")
+            self.assertEqual(reads.call_count, 3)
+        self.assertEqual([line["author"] for line in result], ["Ada", "Bea"])
+        restored = Store(self.temp.name)
+        with patch.object(restored, "get_changeset", side_effect=AssertionError("cached blame read history")), patch.object(restored, "get_tree", side_effect=AssertionError("cached blame read tree")), patch.object(restored, "get_blob", side_effect=AssertionError("cached blame read blob")):
+            self.assertEqual(restored.blame(head["id"], "src/file"), result)
+        self.store.clear_derived()
+        self.assertEqual(self.store.blame(head["id"], "src/file"), result)
+        self.assertEqual(self.store.get_changeset(head["id"]), head)
+
+    def test_indexed_history_branch_filter_directory_deletion_and_readd(self):
+        first = self.commit(changes={"src/file": self.entry("same\n")})
+        branch = self.commit([first["id"]], {"src/file": self.entry("branch\n")}, author="Wrong")
+        main = self.commit([first["id"]], {"elsewhere": self.entry("one")})
+        deletion = self.commit([main["id"]], {"src": None}, author="Deleter")
+        readded = self.commit([deletion["id"]], {"src/file": self.entry("same\n")}, author="New")
+        self.assertEqual([c["id"] for c in self.store.log(readded["id"], path="src/file")], [readded["id"], deletion["id"], first["id"]])
+        self.assertEqual([c["id"] for c in self.store.log(readded["id"], path="src")], [readded["id"], deletion["id"], first["id"]])
+        self.assertEqual(self.store.blame(readded["id"], "src/file")[0]["author"], "New")
+        self.assertEqual(self.store.blame(branch["id"], "src/file")[0]["author"], "Wrong")
+        with self.assertRaises(SCNError) as error:
+            self.store.blame(deletion["id"], "src/file")
+        self.assertEqual(error.exception.status, 404)
+        binary = self.commit([readded["id"]], {"src/file": {"oid": self.store.put_blob(b"\xff")}})
+        text_again = self.commit([binary["id"]], {"src/file": self.entry("same\n")}, author="Text")
+        self.assertEqual(self.store.blame(text_again["id"], "src/file")[0]["author"], "Text")
+
+    def test_legacy_database_lazy_backfill_preserves_original_payloads(self):
+        first = self.commit(changes={"file": self.entry("text\n")})
+        head = self.commit([first["id"]], {"other": self.entry("extra")})
+        self.store.update_ref("main", head["id"], None)
+        with sqlite3.connect(self.store.database) as db:
+            original = db.execute("SELECT * FROM changesets ORDER BY id").fetchall()
+            db.executescript("DROP TABLE derived_values; DROP TABLE graph_nodes; DROP TABLE path_changes;")
+        restored = Store(self.temp.name)
+        self.assertEqual([c["id"] for c in restored.log("main", path="file")], [first["id"]])
+        self.assertEqual(restored.blame("main", "file")[0]["changeset"], first["id"])
+        restored.rebuild_derived("graph", "main")
+        with sqlite3.connect(restored.database) as db:
+            self.assertEqual(db.execute("SELECT * FROM changesets ORDER BY id").fetchall(), original)
+        self.assertEqual(restored.refs(), {"main": head["id"]})
+
+    def test_generic_derivation_handles_history_beyond_recursion_limit(self):
+        # Construct an old-format chain in one transaction to test migration of
+        # long histories without spending time eagerly indexing every commit.
+        parent = None
+        ids = []
+        with sqlite3.connect(self.store.database) as db:
+            for i in range(1050):
+                payload = {"parents": [parent] if parent else [], "changes": {},
+                           "message": str(i), "author": "A", "timestamp": "fixed"}
+                encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+                parent = hashlib.sha256(b"changeset\0" + encoded).hexdigest()
+                ids.append(parent)
+                db.execute("INSERT INTO changesets VALUES (?,?,?)", (parent, encoded.decode(), self.store.empty_tree))
+        self.store.register_derivation("count", 1, lambda change, parents, key: 1 + (parents[0] if parents else 0), parents="first")
+        self.assertEqual(self.store.derive("count", parent), 1050)
+        self.assertEqual(self.store.first_parent_ancestor(parent, 1049), ids[0])
 
 
 if __name__ == "__main__":

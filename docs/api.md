@@ -46,6 +46,7 @@ conflict response.
 | `POST /v1/merge` | `{left, right, message, author}` | Two-parent changeset |
 | `POST /v1/rebase` | `{rev, onto, message, author}` | Replayed changeset |
 | `GET /v1/blame/{rev}` | Required `path` query | `{lines: [{line, text, changeset, author}]}` |
+| `GET /v1/cache/stats` | Cache servers only; authenticated | Lookup, coalescing, upstream and circuit counters |
 
 The `expected` ref value is required: use `null` only when creating a name that
 does not already exist. Otherwise use the exact previous changeset ID. Direct
@@ -56,7 +57,11 @@ Blob uploads can be reused by multiple changesets.
 The cache uses `OPENSCN_TOKEN` for incoming authentication and, by default,
 upstream authentication. Set `OPENSCN_UPSTREAM_TOKEN` separately if the upstream
 uses a different token. Only already-cached immutable blob and tree reads can
-succeed while the upstream is unavailable; metadata and checkout still need it.
+succeed while the upstream is unavailable; new metadata queries and checkouts
+still need it. Resuming an already staged checkout with `openscn recover` does
+not require network access. Overload or an open upstream circuit returns HTTP
+503 with `Retry-After`. Cache tiers bound requests and do not bypass their
+configured upstream.
 
 ## HTTP example
 
@@ -123,6 +128,17 @@ assert store.get_blob(oid) == b"hello\n"
 | `merge(left, right, message, author)` | Two-parent changeset or conflict |
 | `rebase(rev, onto, message, author)` | Replayed changeset or conflict |
 | `blame(rev, path)` | List of `{line, text, changeset, author}` |
+| `first_parent_ancestor(rev, distance)` | Ancestor ID or `None` beyond root |
+| `register_derivation(name, version, compute, *, parents="all", eager=False)` | Register local deterministic recipe |
+| `derive(name, rev, key=None)` | JSON result, computed or loaded from persistent cache |
+| `clear_derived(name=None)` | Discard rebuildable caches; stop writers first |
+| `rebuild_derived(name, rev, key=None)` | Clear named recipe, rebuild through revision |
+
+The embedded `update_ref` provides exact CAS only; the HTTP endpoint adds the
+fast-forward check. Embedded callers needing that policy should check
+`is_ancestor(expected, target)` before CAS. Derived recipes execute trusted local
+Python code and cannot be uploaded through HTTP. See
+[derived-data administration](operations.md#derived-data-administration).
 
 Failures raise `openscn.errors.SCNError` with `message`, `status`, and `details`.
 Only blobs are returned as bytes; other public data structures are JSON

@@ -8,8 +8,10 @@ workspaces, and content-addressed caches. It is MIT licensed, runs on Python
 Inspired by the ideas in Anthropic's
 [Redesigning source control](https://www.anthropic.com/engineering/redesigning-source-control).
 OpenSCN is not Scion, is not affiliated with Anthropic, and makes no claim of
-feature, performance, or operational equivalence. This first release is an
+feature, performance, or operational equivalence. This release is an
 experimental single-node implementation, suitable for learning and evaluation.
+See the [design comparison and review](docs/scion-comparison.md) for implemented
+principles, tested behavior, and remaining gaps.
 
 ## Install
 
@@ -18,13 +20,13 @@ Install a pinned release directly from GitHub:
 ```sh
 python3 -m venv .venv
 . .venv/bin/activate
-python -m pip install 'git+https://github.com/joymadhu49/openscn.git@v0.1.0'
+python -m pip install 'git+https://github.com/joymadhu49/openscn.git@v0.2.0'
 openscn --help
 ```
 
 Alternatively, download the wheel from
 [GitHub Releases](https://github.com/joymadhu49/openscn/releases) and run
-`python -m pip install /path/to/openscn-0.1.0-py3-none-any.whl`.
+`python -m pip install /path/to/openscn-0.2.0-py3-none-any.whl`.
 There is no requirement to install from PyPI. This release targets macOS and
 Linux (POSIX filesystems); Windows is not tested or supported yet.
 
@@ -104,6 +106,22 @@ The cache stores immutable blob and tree responses and forwards metadata and
 writes to the primary server. You can chain these caches. Mutable references
 must still be read from the primary; a cache is not an independent replica.
 
+Simultaneous requests for a missing object share one upstream fetch. Each cache
+defaults to at most 16 active upstream requests, and temporarily stops new
+upstream requests after three consecutive failures. Cached immutable reads
+continue during an outage. Configure this with `--max-upstream`,
+`--failure-threshold`, and `--cooldown`; `/v1/cache/stats` exposes counters using
+the same authentication as other API endpoints. Each tier uses only its
+configured upstream and never bypasses it. Cache disk failures do not prevent
+healthy upstream reads.
+
+Checkouts stage one verified blob at a time before changing workspace files,
+then journal their progress. If interrupted, run `openscn recover` in that
+workspace to finish from the staged files, even while offline. Recovery refuses
+to overwrite conflicting edits; preserve those files elsewhere before retrying.
+Do not delete `.openscn/` or its staging data while recovery is pending. See
+[workspace recovery](docs/operations.md) for details and limits.
+
 ## Branching, merging, and Git import
 
 Changesets form a DAG. A workspace can create changesets without first creating
@@ -153,9 +171,11 @@ collection, hosted service, replicated metadata database, fine-grained access
 control, virtual filesystem, streaming checkout, or demonstrated large-scale
 performance in this release. Client and proxy caches can be discarded; the
 authoritative store cannot. Authentication is one shared token for all users.
-Run one command at a time per workspace; parallel agents should use separate
-workspaces. Updates fetch changed contents before writing but are not atomic
-across all files if interrupted, so keep backups of important local work.
+Mutating commands take an exclusive workspace lock and reject overlapping
+commands; parallel agents should use separate workspaces. Checkout recovery is
+tested for process interruption, but is not a blanket power-loss guarantee or a
+replacement for backups. Arbitrary concurrent writes from external editors
+cannot be made atomic with checkout; pause editing while updating.
 
 ## Develop
 
@@ -165,10 +185,12 @@ cd openscn
 python -m pip install -e .
 python -m unittest discover -s tests -v
 python examples/demo.py
+python examples/benchmark.py --files 1000 --commits 200
 python -m pip install build
 python -m build
 ```
 
 See the [architecture](docs/architecture.md), [HTTP and Python API](docs/api.md),
+[operations and recovery](docs/operations.md), [local measurements](docs/performance.md),
 [contribution guide](CONTRIBUTING.md), and [changelog](CHANGELOG.md).
 Code is available under the [MIT license](LICENSE).

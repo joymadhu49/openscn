@@ -1,4 +1,6 @@
 import os
+import json
+import sys
 from pathlib import Path
 import shutil
 import subprocess
@@ -188,6 +190,146 @@ class ClientTests(unittest.TestCase):
             workspace.update(collided['id'])
         self.assertEqual(workspace.metadata['head'], initial['id'])
         self.assertFalse((workspace.root / 'Folder').exists())
+
+    def test_checkout_stages_one_blob_at_a_time(self):
+        workspace = Workspace.clone(self.url, self.root / 'work')
+        changed = self.change(files={f'file-{i:02}': bytes([i]) * (128 * 1024) for i in range(12)})
+        class LiveBlob(bytes):
+            live = 0
+            peak = 0
+            def __new__(cls, data):
+                obj = super().__new__(cls, data)
+                cls.live += 1
+                cls.peak = max(cls.peak, cls.live)
+                return obj
+            def __del__(self):
+                type(self).live -= 1
+        original = workspace.client.get_blob
+        with patch.object(workspace.client, 'get_blob', side_effect=lambda oid: LiveBlob(original(oid))):
+            workspace.update(changed['id'])
+        self.assertEqual(LiveBlob.peak, 1, 'checkout retained more than one downloaded blob')
+        self.assertEqual(LiveBlob.live, 0)
+        self.assertEqual(workspace.status(), [])
+        self.assertEqual(list((workspace.root / '.openscn').glob('checkout-stage-*')), [])
+
+    def test_failed_second_fetch_cleans_staging_without_worktree_changes(self):
+        first = self.seed({'a': b'old a', 'b': b'old b'})
+        workspace = Workspace.clone(self.url, self.root / 'work')
+        changed = self.change([first['id']], {'a': b'new a', 'b': b'new b'})
+        original = workspace.client.get_blob
+        calls = 0
+        def fetch(oid):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise SCNError('network interrupted')
+            return original(oid)
+        with patch.object(workspace.client, 'get_blob', side_effect=fetch):
+            with self.assertRaisesRegex(SCNError, 'network interrupted'):
+                workspace.update(changed['id'])
+        self.assertEqual((workspace.root / 'a').read_bytes(), b'old a')
+        self.assertEqual((workspace.root / 'b').read_bytes(), b'old b')
+        self.assertEqual(Workspace.open(workspace.root).metadata['head'], first['id'])
+        self.assertFalse(workspace._journal_path.exists())
+        self.assertEqual(list((workspace.root / '.openscn').glob('checkout-stage-*')), [])
+
+    def test_workspace_lock_excludes_other_process_and_reloads_stale_metadata(self):
+        workspace = Workspace.clone(self.url, self.root / 'work')
+        stale = Workspace.open(workspace.root)
+        lock_path = workspace.root / '.openscn/workspace.lock'
+        script = 'import fcntl,sys; f=open(sys.argv[1], "a"); fcntl.flock(f, fcntl.LOCK_EX); print("locked", flush=True); sys.stdin.read(1)'
+        process = subprocess.Popen([sys.executable, '-c', script, str(lock_path)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        try:
+            self.assertEqual(process.stdout.readline().strip(), 'locked')
+            for command in (lambda: workspace.commit('x', 'tester'), workspace.update, workspace.land, lambda: workspace.integrate('merge', 'main', 'x', 'tester'), workspace.recover):
+                with self.assertRaisesRegex(SCNError, 'Another OpenSCN command'):
+                    command()
+        finally:
+            process.communicate('x', timeout=5)
+        (workspace.root / 'a').write_text('a')
+        first = workspace.commit('first', 'tester')
+        (workspace.root / 'b').write_text('b')
+        second = stale.commit('second', 'tester')
+        self.assertEqual(second['parents'], [first['id']])
+        workspace.land()  # This stale object must land the newest local changeset.
+        self.assertEqual(self.store.resolve('main'), second['id'])
+
+    def test_recover_after_install_before_progress_is_offline_and_idempotent(self):
+        first = self.seed({'a': b'old a', 'b': b'old b'})
+        workspace = Workspace.clone(self.url, self.root / 'work')
+        changed = self.change([first['id']], {'a': b'new a', 'b': b'new b'})
+        self.store.update_ref('main', changed['id'], first['id'])
+        original = workspace._apply_checkout_operation
+        def interrupted(operation, staging):
+            original(operation, staging)
+            raise RuntimeError('simulated process interruption')
+        with patch.object(workspace, '_apply_checkout_operation', side_effect=interrupted):
+            with self.assertRaisesRegex(RuntimeError, 'interruption'):
+                workspace.update()
+        self.assertEqual((workspace.root / 'a').read_bytes(), b'new a')
+        self.assertEqual((workspace.root / 'b').read_bytes(), b'old b')
+        reopened = Workspace.open(workspace.root)
+        self.assertEqual(reopened.metadata['head'], first['id'])
+        with self.assertRaisesRegex(SCNError, 'openscn recover'):
+            reopened.commit('blocked', 'tester')
+        with patch.object(reopened.client, 'request', side_effect=AssertionError('recovery must be offline')):
+            self.assertEqual(reopened.recover(), changed['id'])
+        self.assertEqual(reopened.metadata['refs']['main'], changed['id'])
+        self.assertEqual((workspace.root / 'b').read_bytes(), b'new b')
+        self.assertEqual(reopened.status(), [])
+        self.assertFalse(reopened._journal_path.exists())
+        with self.assertRaisesRegex(SCNError, 'No interrupted checkout'):
+            reopened.recover()
+
+    def test_recovery_preserves_edits_and_refuses_pending_file_conflicts(self):
+        first = self.seed({'a': b'old a', 'b': b'old b'})
+        workspace = Workspace.clone(self.url, self.root / 'work')
+        changed = self.change([first['id']], {'a': b'new a', 'b': b'new b'})
+        original = workspace._apply_checkout_operation
+        calls = 0
+        def interrupted(operation, staging):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise RuntimeError('simulated interruption')
+            return original(operation, staging)
+        with patch.object(workspace, '_apply_checkout_operation', side_effect=interrupted):
+            with self.assertRaises(RuntimeError):
+                workspace.update(changed['id'])
+        (workspace.root / 'a').write_text('edit completed file')
+        (workspace.root / 'b').write_text('edit pending file')
+        reopened = Workspace.open(workspace.root)
+        with self.assertRaisesRegex(SCNError, 'preserve local edits at b'):
+            reopened.recover()
+        self.assertEqual((workspace.root / 'a').read_text(), 'edit completed file')
+        self.assertEqual((workspace.root / 'b').read_text(), 'edit pending file')
+        (workspace.root / 'b').write_text('old b')
+        reopened.recover()
+        self.assertEqual((workspace.root / 'a').read_text(), 'edit completed file')
+        self.assertEqual((workspace.root / 'b').read_text(), 'new b')
+        self.assertEqual([change['path'] for change in reopened.status()], ['a'])
+
+    def test_recover_file_directory_transition_and_refuse_corrupt_staging(self):
+        first = self.seed({'x': b'old'})
+        workspace = Workspace.clone(self.url, self.root / 'work')
+        changed = self.change([first['id']], {'x': None, 'x/y': b'new'})
+        original = workspace._apply_checkout_operation
+        def interrupted(operation, staging):
+            original(operation, staging)
+            raise RuntimeError('simulated interruption')
+        with patch.object(workspace, '_apply_checkout_operation', side_effect=interrupted):
+            with self.assertRaises(RuntimeError):
+                workspace.update(changed['id'])
+        journal = json.loads(workspace._journal_path.read_text())
+        staged = workspace.root / '.openscn' / journal['staging'] / '1.blob'
+        staged.write_bytes(b'corrupt')
+        with self.assertRaisesRegex(SCNError, 'integrity verification'):
+            workspace.recover()
+        self.assertFalse((workspace.root / 'x').exists())
+        staged.write_bytes(b'new')
+        workspace.recover()
+        self.assertEqual((workspace.root / 'x/y').read_bytes(), b'new')
+        self.assertEqual(workspace.status(), [])
 
     @unittest.skipUnless(shutil.which('git'), 'git required')
     def test_git_import_preserves_merge_ancestry_modes_and_deletions(self):
