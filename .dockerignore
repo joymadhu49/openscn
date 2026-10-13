@@ -1,0 +1,9 @@
+*
+!Dockerfile
+!pyproject.toml
+!README.md
+!LICENSE
+!openscn/
+!openscn/**
+**/__pycache__/
+**/*.pyc

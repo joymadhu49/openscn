@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openscn"
+version = "0.1.0"
+description = "An independent, server-first source control prototype for agents and humans"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{name = "Joy Madhu"}]
+keywords = ["source-control", "version-control", "content-addressed-storage", "agents"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Software Development :: Version Control",
+]
+dependencies = []
+
+[project.scripts]
+openscn = "openscn.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/joymadhu49/openscn"
+Repository = "https://github.com/joymadhu49/openscn"
+Issues = "https://github.com/joymadhu49/openscn/issues"
+
+[tool.setuptools.packages.find]
+include = ["openscn*"]
+exclude = ["tests*"]

@@ -1,0 +1,38 @@
+name: Release
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Verify tag matches package
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python - <<'PY'
+          import os, tomllib
+          from openscn import __version__
+          with open("pyproject.toml", "rb") as f:
+              package_version = tomllib.load(f)["project"]["version"]
+          assert os.environ["RELEASE_TAG"] == "v" + package_version
+          assert __version__ == package_version
+          PY
+      - run: python -m pip install . build twine
+      - run: python -m unittest discover -s tests -v
+      - run: python examples/demo.py
+      - run: python -m build
+      - run: python -m twine check dist/*
+      - name: Write checksums
+        run: sha256sum dist/* > dist/SHA256SUMS
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: gh release create "$RELEASE_TAG" dist/* --verify-tag --title "OpenSCN $RELEASE_TAG" --prerelease --notes-file docs/release-notes.md
